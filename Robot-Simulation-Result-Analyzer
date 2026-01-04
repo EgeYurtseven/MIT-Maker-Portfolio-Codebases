@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+analyze_sim_results.py
+Summarize robot simulation telemetry into metrics and an IEEE-ready results paragraph.
+
+Usage
+-----
+# Single CSV
+python analyze_sim_results.py out/long_hallway_telemetry.csv --warn 35 --alarm 200 --debounce 3 --out out
+
+# Multiple scenarios
+python analyze_sim_results.py out/*_telemetry.csv --warn 35 --alarm 200 --debounce 3 --out out
+"""
+
+import argparse
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+
+
+def detect_latency(df: pd.DataFrame, thr: float, debounce: int = 3, col: str = "co_filt"):
+    """Return first timestep where signal exceeds threshold for >= debounce samples."""
+    hits = 0
+    for t, v in zip(df["t"].values, df[col].values):
+        if v >= thr:
+            hits += 1
+            if hits >= debounce:
+                return int(t)
+        else:
+            hits = 0
+    return None
+
+
+def state_fraction(df: pd.DataFrame, state_name: str):
+    """Fraction of timesteps spent in a given state (SAFE/WARN/ALARM)."""
+    if "state" not in df.columns:
+        return None
+    vals = (df["state"] == state_name).astype(float)
+    return float(vals.mean())
+
+
+def path_length(df: pd.DataFrame):
+    """Total path length in grid cells (sum of inter-step distances)."""
+    r = df["row"].values
+    c = df["col"].values
+    dr = np.diff(r)
+    dc = np.diff(c)
+    return float(np.sum(np.hypot(dr, dc)))
+
+
+def uwb_stats(df: pd.DataFrame):
+    """Mean/median/95th/max error for UWB estimate if present."""
+    if "uwb_err" not in df.columns:
+        return None
+    e = df["uwb_err"].dropna().values
+    if len(e) == 0:
+        return None
+    return {
+        "mean": float(np.mean(e)),
+        "median": float(np.median(e)),
+        "p95": float(np.percentile(e, 95)),
+        "max": float(np.max(e)),
+        "n": int(len(e)),
+    }
+
+
+def goal_time(df: pd.DataFrame):
+    """Approximate end time as the last recorded timestep."""
+    return int(df["t"].iloc[-1])
+
+
+def summarize_csv(path: Path, warn: float, alarm: float, debounce: int):
+    df = pd.read_csv(path)
+    res = {}
+    res["file"] = str(path)
+    res["n_steps"] = int(df["t"].max()) + 1 if "t" in df.columns else len(df)
+    res["path_length_cells"] = path_length(df)
+    res["latency_warn_t"] = detect_latency(df, warn, debounce, col="co_filt")
+    res["latency_alarm_t"] = detect_latency(df, alarm, debounce, col="co_filt")
+    res["frac_SAFE"] = state_fraction(df, "SAFE")
+    res["frac_WARN"] = state_fraction(df, "WARN")
+    res["frac_ALARM"] = state_fraction(df, "ALARM")
+    res["uwb"] = uwb_stats(df)
+    res["t_end"] = goal_time(df)
+    return res
+
+
+def ieee_paragraph(results):
+    """Compose a compact IEEE-ready paragraph across scenarios."""
+    parts = []
+    for r in results:
+        name = Path(r["file"]).stem.replace("_telemetry", "")
+        uwb = r.get("uwb")
+        uwb_txt = ""
+        if uwb:
+            uwb_txt = (
+                f" UWB localization achieved median error {uwb['median']:.2f} cells "
+                f"(mean {uwb['mean']:.2f}, 95th {uwb['p95']:.2f})."
+            )
+        lat_w = r.get("latency_warn_t")
+        lat_a = r.get("latency_alarm_t")
+        lat_txt = ""
+        if lat_w is not None or lat_a is not None:
+            lat_txt = " Detection latency"
+            if lat_w is not None:
+                lat_txt += f" (warn) {lat_w} steps"
+            if lat_a is not None:
+                lat_txt += f" (alarm) {lat_a} steps"
+            lat_txt += "."
+        frac_warn = r.get("frac_WARN")
+        frac_alarm = r.get("frac_ALARM")
+        frac_txt = ""
+        if frac_warn is not None and frac_alarm is not None:
+            frac_txt = f" State occupancy: WARN {100*frac_warn:.1f}% / ALARM {100*frac_alarm:.1f}%."
+        parts.append(
+            f"In {name}, the robot traversed ~{r['path_length_cells']:.1f} cells in {r['n_steps']} steps."
+            f"{lat_txt}{uwb_txt}{frac_txt}"
+        )
+    return " ".join(parts)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Summarize sim telemetry into IEEE-ready paragraph + metrics JSON"
+    )
+    p.add_argument("csv", nargs="+", help="Telemetry CSV(s) to summarize")
+    p.add_argument("--warn", type=float, default=35.0, help="Warn threshold (ppm)")
+    p.add_argument("--alarm", type=float, default=200.0, help="Alarm threshold (ppm)")
+    p.add_argument("--debounce", type=int, default=3, help="Debounce samples")
+    p.add_argument("--out", type=str, default=".", help="Output directory")
+    args = p.parse_args()
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for csv in args.csv:
+        r = summarize_csv(Path(csv), warn=args.warn, alarm=args.alarm, debounce=args.debounce)
+        results.append(r)
+        name = Path(csv).stem.replace("_telemetry", "")
+        with open(out_dir / f"metrics_{name}.json", "w") as f:
+            json.dump(r, f, indent=2)
+
+    para = ieee_paragraph(results)
+    with open(out_dir / "abstract_results.txt", "w") as f:
+        f.write(para + "\n")
+
+    print("=== Metrics Summary ===")
+    for r in results:
+        print(json.dumps(r, indent=2))
+    print("\n=== IEEE-ready paragraph ===")
+    print(para)
+
+
+if __name__ == "__main__":
+    main()
