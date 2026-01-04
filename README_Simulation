@@ -1,0 +1,129 @@
+# Autonomous Robot Simulator with CO & UWB
+
+This project simulates an autonomous robot navigating structured environments, detecting carbon monoxide (CO) pockets with an **MQ-9B sensor model** and localizing with **Ultra-Wideband (UWB)** trilateration.  
+It supports visualization, telemetry logging, and automatic IEEE-style results reporting.
+
+---
+
+## Folder Structure
+
+```
+robot-sim/
+│
+├── simulation.py              # main simulator script
+├── analyze_sim_results.py     # analyzer for CSVs → metrics + IEEE paragraph
+│
+├── configs/                   # optional config files
+│   ├── sim_config.yaml
+│   ├── sim_config.ini
+│   └── .env.example
+│
+├── out/                       # outputs (auto-created)
+│   ├── long_hallway_telemetry.csv
+│   ├── long_hallway_viz.png
+│   ├── long_hallway_anim.gif
+│   ├── metrics_long_hallway.json
+│   └── abstract_results.txt
+│
+└── README.md
+```
+
+---
+
+## Running Simulations
+
+### 1. Basic Run
+```bash
+python simulation.py --scenario long_hallway --mq9b --out ./out
+```
+
+### 2. All Scenarios
+```bash
+python simulation.py --all --mq9b --animate --out ./out
+```
+
+### 3. Config File (YAML/INI/ENV)
+```bash
+python simulation.py --config configs/sim_config.yaml
+```
+
+---
+
+## Analyzing Results
+
+Run the analyzer on one or more telemetry CSVs:
+
+```bash
+python analyze_sim_results.py ./out/*_telemetry.csv --warn 35 --alarm 200 --debounce 3 --out ./out
+```
+
+This produces:
+- `metrics_<scenario>.json` → structured metrics (latency, state fractions, UWB error, etc.)
+- `abstract_results.txt` → IEEE-ready results paragraph for your paper
+
+---
+
+##  ROS 2 Integration
+
+Optional ROS 2 bridge can publish:
+- `/sim/pose` → PoseStamped  
+- `/sim/co_ppm` → CO ppm (Float32)  
+- `/sim/uwb` → UWB estimated position  
+
+Enable with:
+```bash
+python simulation.py --ros2-bridge ./out/long_hallway_telemetry.csv
+```
+
+---
+
+## Key Features
+
+- **Layouts**: long hallway, rooms, simple maze
+- **Sensors**:
+  - MQ-9B CO sensing (warn=35 ppm, alarm=200 ppm)
+  - UWB localization with noisy anchors
+  - Feature sensor (8-ray obstacle scan with median filter)
+- **Behaviors**:
+  - Cautious speed in hallways
+  - Plume-seeking under WARN
+  - Stop under ALARM
+- **Outputs**: telemetry CSV, heatmap PNG, animation GIF, JSON metrics, IEEE abstract text
+
+---
+
+## Example Workflow
+
+```bash
+# Run a simulation
+python simulation.py --scenario rooms --mq9b --animate --out ./out
+
+# Analyze results
+python analyze_sim_results.py ./out/rooms_telemetry.csv --warn 35 --alarm 200 --out ./out
+
+# View metrics
+cat ./out/metrics_rooms.json
+
+# IEEE abstract paragraph
+cat ./out/abstract_results.txt
+```
+
+---
+
+##  Requirements
+
+- Python 3.8+
+- numpy, pandas, matplotlib
+- (optional) pyyaml, configparser, python-dotenv
+- (optional) ROS 2 + rclpy
+
+Install with:
+```bash
+pip install numpy pandas matplotlib pyyaml python-dotenv
+```
+
+---
+
+## Citation
+
+If you use this simulator in academic work, please cite your IEEE paper built on this framework.
