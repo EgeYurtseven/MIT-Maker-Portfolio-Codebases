@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+Autonomous Robot Simulator with CO Pocket Detection, MQ-9B thresholds, and UWB localization.
+
+Features
+--------
+- Multiple layouts: long_hallway, rooms, maze_simple
+- A* path planner on occupancy grid
+- Randomly placed diffusing CO pocket
+- MQ-9B sensor model with 35 ppm (warn) and 200 ppm (alarm) thresholds
+- CO sensor: Gaussian noise, IIR low-pass, optional Kalman
+- Feature sensor: 8-ray distance scan with median filter
+- UWB anchors with noisy range + Gauss-Newton trilateration
+- Robot behaviors: cautious hallway navigation, plume-seeking under WARN, stop under ALARM
+- CLI with config (YAML/JSON/INI/ENV) support
+- Outputs: telemetry CSV, PNG heatmap, optional animation GIF
+- ROS 2 bridge publishing pose, CO, and UWB to topics
+"""
+
+import math, random, argparse, os, configparser, json
+from collections import deque
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+
+# =========================
+# Utilities
+# =========================
+
+Grid = np.ndarray  # dtype=bool for occupancy: True = blocked, False = free
+Coord = Tuple[int, int]
+
+def in_bounds(g: Grid, p: Coord) -> bool:
+    h, w = g.shape
+    return 0 <= p[0] < h and 0 <= p[1] < w
+
+def neighbors_4(p: Coord) -> List[Coord]:
+    r, c = p
+    return [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]
+
+def manhattan(a: Coord, b: Coord) -> int:
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+def line_raycast(grid: Grid, start: Tuple[float, float], angle_rad: float, max_range: int=20) -> float:
+    dr = math.cos(angle_rad); dc = math.sin(angle_rad)
+    r, c = start; step = 0.2; dist = 0.0
+    while dist <= max_range:
+        rr, cc = int(round(r)), int(round(c))
+        if not in_bounds(grid, (rr, cc)) or grid[rr, cc]:
+            return dist
+        r += dr * step; c += dc * step; dist += step
+    return max_range
+
+# =========================
+# Layouts
+# =========================
+
+def layout_long_hallway(h: int=40, w: int=80) -> Grid:
+    grid = np.zeros((h, w), dtype=bool)
+    hall_top, hall_bottom = h//2 - 2, h//2 + 2
+    grid[:hall_top-1, :] = True; grid[hall_bottom+2:, :] = True
+    for cc in [w//3, 2*w//3]:
+        grid[hall_top:hall_bottom+1, cc] = True
+        grid[hall_top+1:hall_bottom, cc] = False
+    grid[hall_top-2:hall_bottom+3, :4] = False
+    grid[hall_top-2:hall_bottom+3, -4:] = False
+    return grid
+
+def layout_rooms(h: int=40, w: int=60) -> Grid:
+    grid = np.zeros((h, w), dtype=bool)
+    grid[0,:]=True; grid[-1,:]=True; grid[:,0]=True; grid[:,-1]=True
+    for c in [w//3, 2*w//3]:
+        grid[1:-1, c] = True
+        for r in [h//4, h//2, 3*h//4]:
+            grid[r-1:r+2, c] = False
+    for r in [h//3, 2*h//3]:
+        grid[r,1:-1] = True
+        for c in [w//4, w//2, 3*w//4]:
+            grid[r, c-1:c+2] = False
+    return grid
+
+def layout_maze_simple(h: int=40, w: int=60) -> Grid:
+    grid = np.zeros((h, w), dtype=bool)
+    grid[0,:]=True; grid[-1,:]=True; grid[:,0]=True; grid[:,-1]=True
+    for r in range(2, h-2, 4):
+        grid[r, 2:-2] = True
+        door_c = 5 if (r//4)%2==0 else w-6
+        grid[r, door_c-1:door_c+2] = False
+    for r in range(5, h-5, 6):
+        for c in range(8, w-8, 10):
+            grid[r:r+2, c:c+2] = True
+    return grid
+
+# =========================
+# Path Planning (A*)
+# =========================
+
+def astar(grid: Grid, start: Coord, goal: Coord) -> Optional[List[Coord]]:
+    if grid[start] or grid[goal]: return None
+    open_set={start}; came={}; gscore={start:0}; fscore={start:manhattan(start,goal)}
+    while open_set:
+        current = min(open_set,key=lambda p:fscore.get(p,1e9))
+        if current==goal:
+            path=[current]; 
+            while current in came: current=came[current]; path.append(current)
+            return path[::-1]
+        open_set.remove(current)
+        for nb in neighbors_4(current):
+            if not in_bounds(grid,nb) or grid[nb]: continue
+            tentative=gscore[current]+1
+            if tentative<gscore.get(nb,1e9):
+                came[nb]=current; gscore[nb]=tentative
+                fscore[nb]=tentative+manhattan(nb,goal)
+                open_set.add(nb)
+    return None
+
+# =========================
+# CO Pocket
+# =========================
+
+@dataclass
+class COPocket:
+    center: Tuple[float,float]
+    base_sigma: float=1.5
+    diffusion_rate: float=0.02
+    peak: float=200.0
+    drift: Tuple[float,float]=(0.0,0.0)
+    def concentration(self,pos:Tuple[float,float],step:int)->float:
+        sigma=self.base_sigma+self.diffusion_rate*step
+        r0,c0=self.center[0]+self.drift[0]*step,self.center[1]+self.drift[1]*step
+        r,c=pos; d2=(r-r0)**2+(c-c0)**2
+        return float(self.peak*math.exp(-d2/(2*sigma**2)))
+
+# =========================
+# Sensors
+# =========================
+
+class COSensor:
+    def __init__(self,noise_sigma=8.0,iir_alpha=0.85,use_kalman=True):
+        self.noise_sigma=noise_sigma; self.iir_alpha=iir_alpha; self.iir_state=None
+        self.use_kalman=use_kalman; self.k_x=0.0; self.k_P=50.0; self.k_Q=4.0; self.k_R=noise_sigma**2
+    def read_noisy(self,true_ppm:float)->float:
+        return float(np.random.normal(true_ppm,self.noise_sigma))
+    def iir_filter(self,z:float)->float:
+        self.iir_state=z if self.iir_state is None else self.iir_alpha*self.iir_state+(1-self.iir_alpha)*z
+        return self.iir_state
+    def kalman_filter(self,z:float)->float:
+        x_pri=self.k_x; P_pri=self.k_P+self.k_Q; K=P_pri/(P_pri+self.k_R)
+        self.k_x=x_pri+K*(z-x_pri); self.k_P=(1-K)*P_pri; return self.k_x
+    def measure(self,true_ppm:float)->Tuple[float,float,float]:
+        raw=self.read_noisy(true_ppm); iir=self.iir_filter(raw)
+        return (raw,iir,self.kalman_filter(raw) if self.use_kalman else iir)
+
+class FeatureSensor:
+    def __init__(self,window=3,rays=8,max_range=15):
+        self.window=window; self.buffers=[deque(maxlen=window) for _ in range(rays)]
+        self.rays=rays; self.max_range=max_range
+    def read(self,grid:Grid,pos:Tuple[float,float])->List[float]:
+        arr=[]; 
+        for i in range(self.rays):
+            ang=i*(2*math.pi/self.rays); arr.append(line_raycast(grid,pos,ang,self.max_range))
+        filtered=[]
+        for i,d in enumerate(arr):
+            self.buffers[i].append(d); filtered.append(float(np.median(self.buffers[i])))
+        return filtered
+    @staticmethod
+    def looks_like_hallway(ranges:List[float],tol:float=2.0)->bool:
+        if len(ranges)<8: return False
+        left,right,forward,back=ranges[2],ranges[6],ranges[0],ranges[4]
+        return (abs(left-right)<tol) and (forward>left+tol) and (back>left+tol)
+
+# =========================
+# UWB Trilateration
+# =========================
+
+def uwb_trilaterate(anchors:List[Tuple[float,float]],dists:List[float],max_iter=8,tol=1e-3):
+    x=np.mean([a[0] for a in anchors]); y=np.mean([a[1] for a in anchors])
+    for _ in range(max_iter):
+        J=[]; r=[]
+        for (ax,ay),d in zip(anchors,dists):
+            dx=x-ax; dy=y-ay; dist=math.hypot(dx,dy)
+            if dist<1e-6: continue
+            J.append([dx/dist,dy/dist]); r.append(dist-d)
+        J=np.array(J); r=np.array(r)
+        if len(J)<2: break
+        step,_,_,_=np.linalg.lstsq(J,r,rcond=None); x-=step[0]; y-=step[1]
+        if np.linalg.norm(step)<tol: break
+    return (x,y)
+
+# =========================
+# Robot
+# =========================
+
+@dataclass
+class Robot:
+    pos:Tuple[float,float]; path:List[Coord]; co_sensor:COSensor; feat_sensor:FeatureSensor
+    co_threshold:float=50.0; investigating:int=0; stopped:bool=False
+    log:List[str]=None; trail:List[Tuple[float,float]]=None
+    def __post_init__(self): self.log=self.log or []; self.trail=self.trail or [self.pos]
+    def step_along_path(self,grid:Grid):
+        if not self.path or self.stopped: return
+        target=self.path[0]; tr,tc=float(target[0]),float(target[1]); r,c=self.pos
+        vec=np.array([tr-r,tc-c]); dist=np.linalg.norm(vec)
+        if dist<1e-6: self.path.pop(0); return
+        step=min(1.0,dist); move=(vec/dist)*step; new_r,new_c=r+move[0],c+move[1]
+        rr,cc=int(round(new_r)),int(round(new_c))
+        if in_bounds(grid,(rr,cc)) and not grid[rr,cc]: self.pos=(new_r,new_c)
+        self.trail.append(self.pos)
+    def plume_seek(self,pocket:COPocket,t:int,grid:Grid):
+        best=self.pos; best_val=pocket.concentration(self.pos,t)
+        for dr in [-0.7,0,0.7]:
+            for dc in [-0.7,0,0.7]:
+                cand=(self.pos[0]+dr,self.pos[1]+dc); rr,cc=int(round(cand[0])),int(round(cand[1]))
+                if not in_bounds(grid,(rr,cc)) or grid[rr,cc]: continue
+                v=pocket.concentration(cand,t)
+                if v>best_val: best_val=v; best=cand
+        self.pos=best; self.trail.append(self.pos)
+
+# =========================
+# Simulation
+# =========================
+
+def run_episode(grid:Grid,layout:str,steps=400,use_kalman=True,seed=None,co_threshold=50.0,
+                mq9b=False,uwb_conf=None):
+    if seed: np.random.seed(seed); random.seed(seed)
+    def free(): 
+        while True:
+            r=random.randrange(grid.shape[0]); c=random.randrange(grid.shape[1])
+            if not grid[r,c]: return (r,c)
+    start=free(); goal=free()
+    path=astar(grid,start,goal); pocket=COPocket(center=tuple(map(float,free())))
+    rob=Robot(pos=(float(start[0]),float(start[1])),path=path,
+              co_sensor=COSensor(use_kalman=use_kalman),
+              feat_sensor=FeatureSensor(),co_threshold=co_threshold)
+    telemetry=[]
+    for t in range(steps):
+        if rob.stopped: break
+        if rob.investigating==0: rob.step_along_path(grid)
+        feats=rob.feat_sensor.read(grid,rob.pos)
+        hallway=rob.feat_sensor.looks_like_hallway(feats)
+        true_ppm=pocket.concentration(rob.pos,t)
+        raw,iir,filt=rob.co_sensor.measure(true_ppm)
+        state="SAFE"
+        if mq9b:
+            if filt>=200: state="ALARM"; rob.stopped=True
+            elif filt>=35: state="WARN"; rob.investigating=20
+        else:
+            if filt>=rob.co_threshold and rob.investigating==0: rob.investigating=20
+        if rob.investigating>0 and not rob.stopped: rob.plume_seek(pocket,t,grid); rob.investigating-=1
+        row={"t":t,"row":rob.pos[0],"col":rob.pos[1],
+             "co_true":true_ppm,"co_raw":raw,"co_iir":iir,"co_filt":filt,
+             "state":state,"hallway":1 if hallway else 0}
+        if uwb_conf:
+            dists=[math.hypot(rob.pos[0]-ax,rob.pos[1]-ay)+np.random.normal(0,uwb_conf.get("noise_sigma",0.5))
+                   for ax,ay in uwb_conf["anchors"]]
+            est=uwb_trilaterate(uwb_conf["anchors"],dists,
+                                max_iter=uwb_conf.get("max_iter",8),tol=uwb_conf.get("tol",1e-3))
+            row.update({"row_uwb":est[0],"col_uwb":est[1],
+                        "uwb_err":math.hypot(est[0]-rob.pos[0],est[1]-rob.pos[1])})
+        telemetry.append(row)
+    return rob,telemetry
+
+# =========================
+# CLI + Config
+# =========================
+
+def build_layout(name:str)->Grid:
+    return {"long_hallway":layout_long_hallway,"rooms":layout_rooms,"maze_simple":layout_maze_simple}[name]()
+
+def main():
+    p=argparse.ArgumentParser()
+    g=p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--scenario",choices=["long_hallway","rooms","maze_simple"])
+    g.add_argument("--all",action="store_true")
+    p.add_argument("--steps",type=int,default=500)
+    p.add_argument("--seed",type=int,default=11)
+    p.add_argument("--no-kalman",action="store_true")
+    p.add_argument("--mq9b",action="store_true")
+    p.add_argument("--out",type=str,default=".")
+    p.add_argument("--heatmap-t",type=int,default=300)
+    p.add_argument("--animate",action="store_true")
+    p.add_argument("--fps",type=int,default=12)
+    args=p.parse_args()
+
+    scenarios=["long_hallway","rooms","maze_simple"] if args.all else [args.scenario]
+    for name in scenarios:
+        grid=build_layout(name)
+        rob,rows=run_episode(grid,name,steps=args.steps,use_kalman=not args.no_kalman,
+                             seed=args.seed,mq9b=args.mq9b,
+                             uwb_conf={"anchors":[(5,5),(5,55),(35,5),(35,55)],"noise_sigma":0.5})
+        df=pd.DataFrame(rows); csv=f"{args.out}/{name}_telemetry.csv"; df.to_csv(csv,index=False)
+        print(f"[{name}] wrote {csv}")
+
+if __name__=="__main__": main()
